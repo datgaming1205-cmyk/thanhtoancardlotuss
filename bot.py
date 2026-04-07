@@ -175,7 +175,7 @@ async def setuptopcard(ctx, user: discord.Member, amount: int):
     """Chỉnh sửa tổng chi tiêu CARD cho một người dùng"""
     conn = sqlite3.connect('orders.db')
     conn.execute("INSERT INTO leaderboard (user_id, total_spent) VALUES (?, ?) "
-                 "ON CONFLICT(user_id) DO UPDATE SET total_spent = ?", (user.id, amount, amount))
+                  "ON CONFLICT(user_id) DO UPDATE SET total_spent = ?", (user.id, amount, amount))
     conn.commit()
     conn.close()
     await ctx.send(f"✅ Đã cập nhật tổng chi tiêu CARD của {user.mention} thành **{amount:,} VND**.")
@@ -202,7 +202,7 @@ async def deltopcard(ctx, user: discord.Member, amount: int):
     conn.close()
     await update_top_task()
 
-# --- Logic Bảng Top (Đã chỉnh sửa giống hệt ảnh mẫu) ---
+# --- Logic Bảng Top ---
 @tasks.loop(minutes=30)
 async def update_top_task():
     await bot.wait_until_ready()
@@ -269,6 +269,58 @@ async def send_card(telco, amount, serial, code, request_id):
             try: return await resp.json()
             except: return {"status": "0"}
 
+# HÀM XỬ LÝ LOGIC KHI CARD THÀNH CÔNG (Tách riêng để chạy thread-safe)
+async def process_success_card(order, real_value, status, receive):
+    request_id = order["request_id"]
+    user_id = order["user_id"]
+    channel = bot.get_channel(order["channel"])
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    history_channel = bot.get_channel(HISTORY_CHANNEL_ID)
+
+    if log_channel:
+        log_embed = discord.Embed(title="📥 THẺ NẠP MỚI", color=0x3498db)
+        log_embed.add_field(name="Trạng thái", value="Thành công" if status == "1" else f"Lỗi ({status})")
+        log_embed.add_field(name="Khách", value=order["user_name"])
+        log_embed.add_field(name="Thực nhận", value=f"{receive:,} VND")
+        log_embed.add_field(name="Mã Đơn", value=request_id)
+        await log_channel.send(embed=log_embed)
+
+    if status == "1" and real_value == int(order["amount"]):
+        update_leaderboard(user_id, real_value)
+        if user_id in user_ticket_count: user_ticket_count[user_id] = max(0, user_ticket_count[user_id]-1)
+        
+        if channel:
+            embed_tkt = discord.Embed(title="🎉 THANH TOÁN THÀNH CÔNG", description=f"📦 **Tên hàng:** {order['product']}\n💰 **Tiền:** {real_value:,} VND\n🔗 **Link tải:** {order['link']}", color=0x2ecc71)
+            await channel.send(embed=embed_tkt)
+            
+        if history_channel:
+            history_msg = f"<@{user_id}> đã thanh toán đơn hàng **{order['product']}** với số tiền **{real_value:,} VND**, Bạn đánh giá dịch vụ của chúng tớ tại {FEEDBACK_CHANNEL_MENTION} nhé!"
+            await history_channel.send(history_msg)
+            
+        guild = channel.guild if channel else None
+        if guild:
+            member = guild.get_member(user_id)
+            if member:
+                role = guild.get_role(WARRANTY_ROLE_ID)
+                if role: 
+                    try: await member.add_roles(role)
+                    except: pass
+                    expiry = (datetime.now() + timedelta(days=3)).timestamp()
+                    conn = sqlite3.connect('orders.db')
+                    conn.execute("INSERT OR REPLACE INTO warranty VALUES (?, ?, ?)", (user_id, guild.id, expiry))
+                    conn.commit()
+                    conn.close()
+                dm_text = (f"Chúc mừng bạn đã mua thành công đơn hàng **{order['product']}** với số tiền **{real_value:,} VND**. "
+                           f"Bạn có **3 ngày bảo hành** từ ***LoTuss's Schematic Shop***, sau **3 ngày bảo hành sẽ hết hạn!** "
+                           f"Cảm ơn bạn đã tin tưởng và sử dụng dịch vụ của chúng tôi nhé!")
+                try: await member.send(dm_text)
+                except: pass
+        delete_order(request_id)
+    elif status == "1" and real_value != int(order["amount"]):
+        if channel: await channel.send(f"⚠️ Thẻ đúng nhưng sai mệnh giá. Không hoàn tiền.")
+    elif status == "3" and channel: 
+        await channel.send("❌ Thẻ đã sử dụng hoặc không hợp lệ.")
+
 @app.api_route("/callback", methods=["GET", "POST"])
 async def callback(request: Request):
     data = {}
@@ -286,50 +338,11 @@ async def callback(request: Request):
 
     order = get_order(request_id)
     if order:
-        channel = bot.get_channel(order["channel"])
-        log_channel = bot.get_channel(LOG_CHANNEL_ID)
-        history_channel = bot.get_channel(HISTORY_CHANNEL_ID)
-
-        if log_channel:
-            log_embed = discord.Embed(title="📥 THẺ NẠP MỚI", color=0x3498db)
-            log_embed.add_field(name="Trạng thái", value="Thành công" if status == "1" else f"Lỗi ({status})")
-            log_embed.add_field(name="Khách", value=order["user_name"])
-            log_embed.add_field(name="Thực nhận", value=f"{receive:,} VND")
-            log_embed.add_field(name="Mã Đơn", value=request_id)
-            bot.loop.create_task(log_channel.send(embed=log_embed))
-
-        if status == "1" and real_value == int(order["amount"]):
-            user_id = order["user_id"]
-            update_leaderboard(user_id, real_value)
-            
-            if user_id in user_ticket_count: user_ticket_count[user_id] = max(0, user_ticket_count[user_id]-1)
-            if channel:
-                embed_tkt = discord.Embed(title="🎉 THANH TOÁN THÀNH CÔNG", description=f"📦 **Tên hàng:** {order['product']}\n💰 **Tiền:** {real_value:,} VND\n🔗 **Link tải:** {order['link']}", color=0x2ecc71)
-                bot.loop.create_task(channel.send(embed=embed_tkt))
-            if history_channel:
-                history_msg = f"<@{user_id}> đã thanh toán đơn hàng **{order['product']}** với số tiền **{real_value:,} VND**, Bạn đánh giá dịch vụ của chúng tớ tại {FEEDBACK_CHANNEL_MENTION} nhé!"
-                bot.loop.create_task(history_channel.send(history_msg))
-            guild = channel.guild if channel else None
-            if guild:
-                member = guild.get_member(user_id)
-                if member:
-                    role = guild.get_role(WARRANTY_ROLE_ID)
-                    if role: 
-                        bot.loop.create_task(member.add_roles(role))
-                        expiry = (datetime.now() + timedelta(days=3)).timestamp()
-                        conn = sqlite3.connect('orders.db')
-                        conn.execute("INSERT OR REPLACE INTO warranty VALUES (?, ?, ?)", (user_id, guild.id, expiry))
-                        conn.commit()
-                        conn.close()
-                    dm_text = (f"Chúc mừng bạn đã mua thành công đơn hàng **{order['product']}** với số tiền **{real_value:,} VND**. "
-                               f"Bạn có **3 ngày bảo hành** từ ***LoTuss's Schematic Shop***, sau **3 ngày bảo hành sẽ hết hạn!** "
-                               f"Cảm ơn bạn đã tin tưởng và sử dụng dịch vụ của chúng tôi nhé!")
-                    try: bot.loop.create_task(member.send(dm_text))
-                    except: pass
-            delete_order(request_id)
-        elif status == "1" and real_value != int(order["amount"]):
-            if channel: bot.loop.create_task(channel.send(f"⚠️ Thẻ đúng nhưng sai mệnh giá. Không hoàn tiền."))
-        elif status == "3" and channel: bot.loop.create_task(channel.send("❌ Thẻ đã sử dụng hoặc không hợp lệ."))
+        # SỬA LỖI: Sử dụng run_coroutine_threadsafe để đẩy tác vụ sang Bot an toàn
+        asyncio.run_coroutine_threadsafe(
+            process_success_card(order, real_value, status, receive), 
+            bot.loop
+        )
     return {"status": 1, "message": "success"}
 
 @tasks.loop(hours=1)
